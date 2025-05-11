@@ -2,15 +2,16 @@ import pandas as pd
 import ollama
 import os
 import re
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams, PointStruct, OptimizersConfigDiff, Filter, FieldCondition, MatchValue, Range
+from qdrant_client.http.models import Distance, VectorParams, PointStruct, OptimizersConfigDiff, Filter, FieldCondition, MatchValue
 import logging
-import pickle
 import random
 from datetime import datetime
 from dotenv import load_dotenv
+import json
+import hashlib
 
 # Load environment variables
 load_dotenv()
@@ -30,7 +31,7 @@ class PowerOutageAssistant:
         
         if all(df is not None for df in [self.oms_df, self.ami_df, self.scada_df]):
             try:
-                model_name = os.getenv('EMBEDDING_MODEL', 'BAAI/bge-small-en-v1.5')
+                model_name = os.getenv('EMBEDDING_MODEL')
                 token = os.getenv('HF_TOKEN', None)
                 self.model = SentenceTransformer(model_name, use_auth_token=token)
                 self.qdrant_client = QdrantClient(os.getenv('QDRANT_URL', "http://localhost:6333"))
@@ -57,128 +58,178 @@ class PowerOutageAssistant:
         except Exception as e:
             logging.error(f"Failed to load {filename}: {str(e)[:100]}...")
             return None
-
-    def create_text_representations(self) -> List[str]:
-        """Generate semantically rich, LLM-optimized RAG chunks for outage detection."""
-        from config.config import templates
-
-        texts = []
-        for df, prefix in [
-            # (self.customer_df, 'CIS'), 
-            (self.oms_df, 'OMS'), 
-            (self.ami_df, 'AMI'), 
-            (self.scada_df, 'SCADA')
-        ]:
-            if df is not None:
-                df = df.copy()
-                if prefix == 'OMS':
-                    df = df.rename(columns={"Duration (hrs)": "Duration_hrs"})
-                if prefix == 'OMS' and 'Date' in df.columns:
-                    df['Date'] = pd.to_datetime(df['Date'], format='%d-%m-%Y', errors='coerce').dt.strftime('%Y-%m-%d')
-                if prefix == 'AMI' and 'ReadingTimestamp' in df.columns:
-                    df['ReadingTimestamp'] = pd.to_datetime(df['ReadingTimestamp'], format='%d-%m-%Y %H:%M', errors='coerce').dt.strftime('%Y-%m-%d')
-                if prefix == 'SCADA' and 'DetectedTime' in df.columns:
-                    df['DetectedTime'] = pd.to_datetime(df['DetectedTime'], format='%d-%m-%Y %H:%M', errors='coerce').dt.strftime('%Y-%m-%d')
-
-                df = df.fillna('unknown')
-
-                texts.extend(df.apply(
-                    lambda row: templates[prefix].format(**row.to_dict()),
-                    axis=1
-                ))
-
-        # print(texts)
-        return texts
-
+        
     def initialize_vector_store(self) -> List[str]:
         """Optimized vector store init with hybrid search and fault tolerance"""
-        from config.config import create_new_embedding
+        from config.config import qdrant_collection_name
 
-        collection_name = "power_outage_vectors_v2"
-        if create_new_embedding: os.remove(self.texts_file) if os.path.exists(self.texts_file) else None
+        texts = self._create_text_representations(qdrant_collection_name)
 
-        texts = self._load_cached_texts(collection_name) if os.path.exists(self.texts_file) else []
+        if not texts: 
+            logging.info("No new texts to index")
+            return []
         
-        if not texts:
-            texts = self.create_text_representations()
+        try:
+            self._update_or_create_embeddings(qdrant_collection_name, texts)
+            return [text for text, _, _, _ in texts]
+        except Exception as e:
+            logging.error(f"Vector store initialization failed: {e}")
+            return []
 
-            if not texts: 
-                return []
+    def _create_text_representations(self, collection_name: str) -> List[Tuple[str, int, str, str]]:
+        from config.config import templates
+
+        try:
+            existing_hashes = self._get_existing_hashes(collection_name)
+            texts = []
+            record_id_counter = 1
+
+            for df, prefix in [
+                (self.oms_df, 'OMS'), 
+                (self.ami_df, 'AMI'), 
+                (self.scada_df, 'SCADA')
+            ]:
+                if df is not None:
+                    df = df.copy()
+                    if prefix == 'OMS':
+                        df = df.rename(columns={"Duration (hrs)": "Duration_hrs"})
+                    if prefix == 'OMS' and 'Date' in df.columns:
+                        df['Date'] = pd.to_datetime(df['Date'], format='%d-%m-%Y', errors='coerce').dt.strftime('%Y-%m-%d')
+                    if prefix == 'AMI' and 'ReadingTimestamp' in df.columns:
+                        df['ReadingTimestamp'] = pd.to_datetime(df['ReadingTimestamp'], format='%d-%m-%Y %H:%M', errors='coerce').dt.strftime('%Y-%m-%d')
+                    if prefix == 'SCADA' and 'DetectedTime' in df.columns:
+                        df['DetectedTime'] = pd.to_datetime(df['DetectedTime'], format='%d-%m-%Y %H:%M', errors='coerce').dt.strftime('%Y-%m-%d')
+
+                    df = df.fillna('unknown')
+
+                    def compute_row_hash(row):
+                        row_dict = row.dropna().to_dict()
+                        row_json = json.dumps(row_dict, sort_keys=True, default=str)
+                        return hashlib.sha256(row_json.encode('utf-8')).hexdigest()
+
+                    df['row_hash'] = df.apply(compute_row_hash, axis=1)
+                    df['record_id'] = range(record_id_counter, record_id_counter + len(df))  
+                    record_id_counter += len(df)
+
+                    for _, row in df.iterrows():
+                        record_id = row['record_id']
+                        row_hash = row['row_hash']
+                        if str(record_id) in existing_hashes and existing_hashes[str(record_id)] == row_hash:
+                            continue
+
+                        try:
+                            text = templates[prefix].format(**row.to_dict())
+                            texts.append((text, record_id, prefix, row_hash))
+                        except KeyError as e:
+                            logging.warning(f"Template formatting failed for {record_id}: {e}")
+                            continue
             
-            try:
-                self._recreate_collection(collection_name, texts)
-                logging.info(f"Indexed {len(texts)} outage data chunks")
-            except Exception as e:
-                logging.error(f"Vector store init failed: {e}")
-                return []
-
-        return texts
-
-    def _load_cached_texts(self, collection_name: str) -> List[str]:
-        """Safe cached texts loader with validation"""
-        with open(self.texts_file, 'rb') as f:
-            texts = pickle.load(f)
-        if self.qdrant_client.collection_exists(collection_name):
+            if texts: logging.info(f"Generated {len(texts)} new text representations")
             return texts
-        return []
-
-    def _recreate_collection(self, collection_name: str, texts: List[str]):
-        """Atomic collection rebuild with optimized settings."""
-        import re
-        embeddings = self.model.encode(texts, batch_size=64, show_progress_bar=False)
-        
-        if self.qdrant_client.collection_exists(collection_name):
-            self.qdrant_client.delete_collection(collection_name)
-        
-        self.qdrant_client.create_collection(
-            collection_name=collection_name,
-            vectors_config=VectorParams(
-                size=embeddings.shape[1],
-                distance=Distance.COSINE,
-                on_disk=True
-            ),
-            optimizers_config=OptimizersConfigDiff(
-                indexing_threshold=10000
-            )
-        )
-        
-        points = []
-        for idx, (embedding, text) in enumerate(zip(embeddings, texts)):
-            date_match = re.search(r'(on|Detected|Timestamp)\s*:\s*(\d{4}-\d{2}-\d{2})', text, re.IGNORECASE)
-            customer_id_match = re.search(
-                r'(?:Affected Customers IDs: \[([^\]]*)\]|Customer ID (\d+)|ID (\d+))',
-                text,
-                re.IGNORECASE
-            )
-
-            customer_ids = []
-            if customer_id_match:
-                if customer_id_match.group(1):  # OMS/SCADA: Affected Customers IDs
-                    customer_ids = [id.strip() for id in customer_id_match.group(1).split(",") if id.strip().isdigit()]
-                elif customer_id_match.group(2):  # AMI: Customer ID
-                    customer_ids = [customer_id_match.group(2)]
-                elif customer_id_match.group(3):  # CIS: ID
-                    customer_ids = [customer_id_match.group(3)]
-
-            payload = {
-                "text": text,
-                "source": text.split(':')[0].split()[0],
-                "date": date_match.group(2) if date_match else "",
-                "customer_ids": customer_ids
-            }
+        except Exception as e:
+            logging.error(f"Text representation creation failed: {e}")
+            return []
     
-            points.append(PointStruct(
-                id=idx,
-                vector=embedding.tolist(),
-                payload=payload
-            ))
-        
-        self.qdrant_client.upsert(collection_name=collection_name, points=points)
-        with open(self.texts_file, 'wb') as f:
-            pickle.dump(texts, f, protocol=pickle.HIGHEST_PROTOCOL)
+    def _get_existing_hashes(self, collection_name: str) -> Dict[str, str]:
+        """Fetch existing point hashes from Qdrant with pagination."""
 
+        try:
+            if not self.qdrant_client.collection_exists(collection_name):
+                return {}
+            
+            points = []
+            offset = None
+            while True:
+                batch, next_offset = self.qdrant_client.scroll(
+                    collection_name=collection_name,
+                    scroll_filter=None,
+                    limit=1000,
+                    with_payload=True,
+                    with_vectors=False,
+                    offset=offset
+                )
+                points.extend(batch)
+                if not next_offset:
+                    break
+                offset = next_offset
+
+            hashes = {str(p.id): p.payload.get("record_hash", "") for p in points}
+            # logging.info(f"Fetched {len(hashes)} existing hashes from {collection_name}")
+            return hashes
+
+        except Exception as e:
+            logging.error(f"Error fetching existing hashes: {e}")
+            return {}
+
+    def _update_or_create_embeddings(self, collection_name: str, texts: List[Tuple[str, int, str, str]]) -> None:
+        """Update or create Qdrant collection with batched embeddings."""
+
+        try:
+            if not texts:
+                return
+            
+            batch_size = 1000
+            for i in range(0, len(texts), batch_size):
+                batch_texts = texts[i:i + batch_size]
+                embeddings = self.model.encode(
+                    [text for text, _, _, _ in batch_texts],
+                    batch_size=64,
+                    show_progress_bar=False
+                )
+                
+                points = []
+                for (text, record_id, source, hash_code), embedding in zip(batch_texts, embeddings):
+                    date_match = re.search(r'(on|Detected|Timestamp)\s*:\s*(\d{4}-\d{2}-\d{2})', text, re.IGNORECASE)
+                    customer_id_match = re.search(
+                        r'(?:Affected Customers IDs: \[([^\]]*)\]|Customer ID (\d+)|ID (\d+))',
+                        text,
+                        re.IGNORECASE
+                    )
+
+                    customer_ids = []
+                    if customer_id_match:
+                        if customer_id_match.group(1):  
+                            customer_ids = [id.strip() for id in customer_id_match.group(1).split(",") if id.strip().isdigit()]
+                        elif customer_id_match.group(2): 
+                            customer_ids = [customer_id_match.group(2)]
+
+                    points.append(PointStruct(
+                        id=record_id,
+                        vector=embedding.tolist(),
+                        payload = {
+                                "text": text,
+                                "source": source,
+                                "date": date_match.group(2) if date_match else "",
+                                "customer_ids": customer_ids,
+                                "record_hash": hash_code,
+                            }
+                    ))
+        
+                if not self.qdrant_client.collection_exists(collection_name):
+                    self.qdrant_client.create_collection(
+                        collection_name=collection_name,
+                        vectors_config=VectorParams(
+                            size=embeddings.shape[1],
+                            distance=Distance.COSINE,
+                            on_disk=True
+                        ),
+                        optimizers_config=OptimizersConfigDiff(
+                            indexing_threshold=10_000
+                        )
+                    )
+                    logging.info(f"Created new Qdrant collection: {collection_name}")
+
+                self.qdrant_client.upsert(collection_name=collection_name, points=points)
+                logging.debug(f"Upserted {len(points)} points in batch")
+
+            logging.info(f"Updated {collection_name} with {len(texts)} embeddings")
+        except Exception as e:
+            logging.error(f"Embedding update failed: {e}")
+            raise
+        
     def retrieve_documents(self, query: str, context: Dict[str, Any], k: int = 5) -> List[Dict]:
         """Retrieve text chunks based on query and context with exact date filtering."""
+        from config.config import qdrant_collection_name
 
         if not self.qdrant_client:
             logging.warning("Vector store offline")
@@ -211,7 +262,7 @@ class PowerOutageAssistant:
             filter_condition = Filter(must=filters) if filters else None
 
             results = self.qdrant_client.query_points(
-                collection_name="power_outage_vectors_v2",
+                collection_name=qdrant_collection_name,
                 query=query_embedding.tolist(),
                 limit=k,
                 with_payload=True,
@@ -359,8 +410,8 @@ class PowerOutageAssistant:
                         current_timestamp=context.get('current_timestamp')
                     )
             
-            logging.info("Llama prompt\n")
-            print(f"'''\n{llama_prompt}\n'''\n")
+            # logging.info("Llama prompt\n")
+            # print(f"'''\n{llama_prompt}\n'''\n")
 
             # Generate response using LLaMA model, passing the context, retrieved documents, and user input
             response = ollama.chat(
@@ -370,7 +421,7 @@ class PowerOutageAssistant:
                     "content": llama_prompt
                 }],
                 options={
-                    "temperature": 0.3,
+                    "temperature": 0.4,
                     "max_tokens": 120,
                 }
             )
@@ -416,9 +467,9 @@ class PowerOutageAssistant:
             else:
                 intent = session["intent"]
 
-            # if intent == "outage_report":
-            #     response = self.generate_llama_response(context, user_input)
-            #     return {"status": "success", "message": response}
+            if intent == "outage_report":
+                response = self.generate_llama_response(context, user_input)
+                return {"status": "success", "message": response}
 
             if intent == "change_email":
                 if session["pending_action"] is None:
@@ -458,42 +509,27 @@ class PowerOutageAssistant:
 if __name__ == "__main__":
     assistant = PowerOutageAssistant('data')
 
-    # Customer 1001 - Today Outage Inquiry
-    response = assistant.chat('Why is there no power at my house today?', '1008')
-    print("\n[Customer 1008] Query: 'Why is there no power at my house today?'\nResponse:", response["message"], '\n')
+    user_id = 1008
+    response = assistant.chat('Why is there no power at my house today?', user_id)
+    print(f"\n[Customer {user_id}] Query: 'Why is there no power at my house today?'\nResponse:", response["message"], '\n')
 
-    # # Customer 1001 - Historical Outage Count
-    # response = assistant.chat('How many outages were caused by storms this year?', '1001')
-    # print("[Customer 1001] Query: 'How many outages were caused by storms this year?'\nResponse:", response["message"], '\n')
+    response = assistant.chat('How many outages were caused by storms this year?', user_id)
+    print(f"[Customer {user_id}] Query: 'How many outages were caused by storms this year?'\nResponse:", response["message"], '\n')
 
-    # # Customer 1001 - 2-Hour Outage Report
-    # response = assistant.chat('My house has been experiencing a power cut for the last 2 hours.', '1001')
-    # print("[Customer 1001] Query: 'My house has been experiencing a power cut for the last 2 hours.'\nResponse:", response["message"], '\n')
+    response = assistant.chat('My house has been experiencing a power cut for the last 2 hours.', user_id)
+    print(f"[Customer {user_id}] Query: 'My house has been experiencing a power cut for the last 2 hours.'\nResponse:", response["message"], '\n')
 
-    # # Customer 1002 - 2-Hour Outage Report (Suspended Account)
-    # response = assistant.chat('My house has been experiencing a power cut for the last 2 hours.', '1002')
-    # print("[Customer 1002] Query: 'My house has been experiencing a power cut for the last 2 hours.'\nResponse:", response["message"], '\n')
+    response = assistant.chat('I think there is a fault, the lights are not turning on.', user_id)
+    print(f"[Customer {user_id}] Query: 'I think there is a fault, the lights are not turning on.'\nResponse:", response["message"], '\n')
 
-    # # Customer 1003 - Area Outage Inquiry
-    # response = assistant.chat('Why is there no power supply in my area?', '1003')
-    # print("[Customer 1003] Query: 'Why is there no power supply in my area?'\nResponse:", response["message"], '\n')
+    response = assistant.chat('No response from smart meter and no electricity.', user_id)
+    print(f"[Customer {user_id}] Query: 'No response from smart meter and no electricity.'\nResponse:", response["message"], '\n')
 
-    # # Customer 1004 - Suspected Fault
-    # response = assistant.chat('I think there is a fault, the lights are not turning on.', '1004')
-    # print("[Customer 1004] Query: 'I think there is a fault, the lights are not turning on.'\nResponse:", response["message"], '\n')
+    response = assistant.chat('Is there scheduled maintenance at my address tomorrow?', user_id)
+    print(f"[Customer {user_id}] Query: 'Is there scheduled maintenance at my address tomorrow?'\nResponse:", response["message"], '\n')
 
-    # # Customer 1005 - Smart Meter Issue
-    # response = assistant.chat('No response from smart meter and no electricity.', '1005')
-    # print("[Customer 1005] Query: 'No response from smart meter and no electricity.'\nResponse:", response["message"], '\n')
+    response = assistant.chat('Was there an outage on February 30, 2025?', user_id)
+    print(f"[Customer {user_id}] Query: 'Was there an outage on February 30, 2025?'\nResponse:", response["message"], '\n')
 
-    # # Customer 1006 - Scheduled Maintenance Check
-    # response = assistant.chat('Is there scheduled maintenance at my address tomorrow?', '1006')
-    # print("[Customer 1006] Query: 'Is there scheduled maintenance at my address tomorrow?'\nResponse:", response["message"], '\n')
-
-    # # Customer 1007 - Invalid Date Query
-    # response = assistant.chat('Was there an outage on February 30, 2025?', '1007')
-    # print("[Customer 1007] Query: 'Was there an outage on February 30, 2025?'\nResponse:", response["message"], '\n')
-
-    # # Customer 1008 - Ambiguous Temporal Query
-    # response = assistant.chat('Why was there no power sometime last week?', '1008')
-    # print("[Customer 1008] Query: 'Why was there no power sometime last week?'\nResponse:", response["message"], '\n')
+    response = assistant.chat('Why was there no power sometime last week?', user_id)
+    print(f"[Customer {user_id}] Query: 'Why was there no power sometime last week?'\nResponse:", response["message"], '\n')
