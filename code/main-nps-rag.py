@@ -5,13 +5,15 @@ import re
 from typing import Dict, Any, Optional, List, Tuple
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams, PointStruct, OptimizersConfigDiff, Filter, FieldCondition, MatchValue
+from qdrant_client.http.models import Distance, VectorParams, PointStruct, OptimizersConfigDiff, Filter, FieldCondition, MatchValue, Range
 import logging
 import random
 from datetime import datetime
 from dotenv import load_dotenv
 import json
 import hashlib
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Load environment variables
 load_dotenv()
@@ -63,12 +65,15 @@ class PowerOutageAssistant:
         """Optimized vector store init with hybrid search and fault tolerance"""
         from config.config import qdrant_collection_name
 
+        # self.qdrant_client.delete_collection(qdrant_collection_name)
+
         texts = self._create_text_representations(qdrant_collection_name)
 
         if not texts: 
-            logging.info("No new texts to index")
+            # logging.info("No new texts to index")
             return []
         
+        # print(texts)
         try:
             self._update_or_create_embeddings(qdrant_collection_name, texts)
             return [text for text, _, _, _ in texts]
@@ -193,13 +198,22 @@ class PowerOutageAssistant:
                         elif customer_id_match.group(2): 
                             customer_ids = [customer_id_match.group(2)]
 
+                    date_timestamp = 0
+                    if date_match:
+                        try:
+                            date_str = date_match.group(2)
+                            date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+                            date_timestamp = int(date_obj.timestamp())
+                        except ValueError as e:
+                            logging.warning(f"Failed to parse date {date_str}: {e}")
+
                     points.append(PointStruct(
                         id=record_id,
                         vector=embedding.tolist(),
                         payload = {
                                 "text": text,
                                 "source": source,
-                                "date": date_match.group(2) if date_match else "",
+                                "date": date_timestamp,
                                 "customer_ids": customer_ids,
                                 "record_hash": hash_code,
                             }
@@ -227,7 +241,7 @@ class PowerOutageAssistant:
             logging.error(f"Embedding update failed: {e}")
             raise
         
-    def retrieve_documents(self, query: str, context: Dict[str, Any], k: int = 5) -> List[Dict]:
+    def retrieve_documents(self, query: str, context: Dict[str, Any], temporal_dates: List[str], k: int = 5) -> List[Dict]:
         """Retrieve text chunks based on query and context with exact date filtering."""
         from config.config import qdrant_collection_name
 
@@ -236,20 +250,28 @@ class PowerOutageAssistant:
             return []
 
         try:
-            query_date = context.get('current_timestamp')
             user_id = str(context.get('id', 'unknown'))
             context_text = self.format_context(context)
             combined_input = f"{query}\n\n{context_text}"
             query_embedding = self.model.encode([combined_input], show_progress_bar=False)[0]
 
             filters = []
-            if query_date:
-                filters.append(
-                    FieldCondition(
-                        key="date",
-                        match=MatchValue(value=query_date)
-                    )
-                )
+            date_filters = []
+            if temporal_dates:
+                try:
+                    for query_date in temporal_dates:
+                        date_obj = datetime.strptime(query_date, '%Y-%m-%d')
+                        date_timestamp = int(date_obj.timestamp())
+                        date_filters.append(
+                            FieldCondition(
+                                key="date",
+                                match=MatchValue(
+                                    value=date_timestamp 
+                                )
+                            )
+                        )
+                except ValueError as e:
+                    logging.warning(f"Failed to parse query_date {query_date}: {e}")
             
             if user_id != 'unknown':
                 filters.append(
@@ -259,7 +281,10 @@ class PowerOutageAssistant:
                     )
                 )
 
-            filter_condition = Filter(must=filters) if filters else None
+            filter_condition = Filter(
+                must=filters, 
+                should=date_filters if date_filters else None  
+            ) if filters or date_filters else None
 
             results = self.qdrant_client.query_points(
                 collection_name=qdrant_collection_name,
@@ -281,7 +306,7 @@ class PowerOutageAssistant:
                     "metadata": {
                         "source": doc.payload.get('source', 'Unknown'),
                         "customer_match": user_id in text,
-                        "date_match": query_date in text
+                        "date_match": any(query_date in text for query_date in temporal_dates)
                     }
                 })
                 logging.debug(f"Retrieved chunk: {text[:100]} (score: {doc.score})")
@@ -342,28 +367,18 @@ class PowerOutageAssistant:
 
     def detect_intent_with_llama(self, user_input: str) -> str:
         """Detect the intent of the user's input using LLaMA."""
-        prompt = (
-            f"You are an intelligent assistant in the energy utility domain. A user has sent the following message:\n\n"
-            f"\"{user_input}\"\n\n"
-            "Classify the user's intent into one of these categories:\n"
-            "- billing_query\n"
-            "- payment_issue\n"
-            "- outage_report\n"
-            "- service_request\n"
-            "- change_email\n"
-            "- change_password\n"
-            "- change_address\n"
-            "- change_mobile_number\n"
-            "- other\n\n"
-            "Respond only with the intent label"
-        )
+        from config.config import user_intent_prompt
 
         try:
             response = ollama.chat(
                 model="llama3.2",
-                messages=[
-                    {"role": "system", "content": "You classify user intent based on message."},
-                    {"role": "user", "content": prompt}
+                messages=[{
+                    "role": "system", 
+                     "content": "You classify user intent based on message."},
+                    {"role": "user", 
+                     "content": user_intent_prompt.format(
+                                    user_input=user_input
+                                )}
                 ],
                 options={"temperature": 0.4}
             )
@@ -382,7 +397,8 @@ class PowerOutageAssistant:
         import random
         import ollama
         import re
-        from config.config import PROMPT
+        import ast
+        from config.config import outage_assistant_prompt, temporal_query_prompt
 
         ticket_number = f"SR-{random.randint(10000, 99999)}"
         # logging.info(f"Generated ticket number: {ticket_number}")
@@ -391,27 +407,57 @@ class PowerOutageAssistant:
             return f"{context.get('customer_name', 'Customer')}, your account is not active. Would you like to raise a service request ({ticket_number})?"
 
         try:
-            retrieved_docs = self.retrieve_documents(user_input, context, k=50)
+            temporal_query_prompt = temporal_query_prompt.format(
+                                    current_timestamp=context.get('current_timestamp'),
+                                    user_input=user_input
+                                )
+            
+            # logging.info("Temporal Query Prompt:\n")
+            # print(f"'''\n{temporal_query_prompt}\n'''\n")
+
+            response = ollama.chat(
+                model="llama3.2",
+                messages=[
+                    {"role": "user", 
+                     "content": temporal_query_prompt}
+                ],
+                options={"temperature": 0.1}
+            )
+
+            response = response['message']['content']
+            temporal_dates = []
+            if response and response.strip() != "[]":
+                try:
+                    parsed_content = ast.literal_eval(response)
+                    # print(parsed_content)
+                    if parsed_content:
+                        temporal_dates = [item["interpreted"] for item in parsed_content]
+                        context['temporal_intent'] = parsed_content[0].get('intent')
+                except (ValueError, SyntaxError) as e:
+                    logging.error("Failed to parse model output:", e)
+
+            retrieved_docs = self.retrieve_documents(user_input, context, temporal_dates, k=50)
             retrieved_context = "\n".join(doc['text'] for doc in retrieved_docs) if retrieved_docs else "No relevant data found."
             retrieved_context = re.sub(r'\(?\d+\.\d+,\s?-?\d+\.\d+\)?', '', retrieved_context)
 
-            # logging.info(f"Retrieved context for query '{user_input}': {retrieved_context}")
-
-            llama_prompt = PROMPT.format(
-                        retrieved_context=retrieved_context,
-                        user_input=user_input,
-                        ticket_number=ticket_number,
+            llama_prompt = outage_assistant_prompt.format(
+                        customer_id=context.get('id', 'unknown'),
                         customer_name=context.get('customer_name', 'Customer'),
                         account_status=context.get('active', 'unknown'),
                         service_address=context.get('service_address', 'unknown'),
-                        customer_id=context.get('id', 'unknown'),
                         Latitude=context.get('latitude', '0.0'),
                         Longitude=context.get('longitude', '0.0'),
-                        current_timestamp=context.get('current_timestamp')
+                        current_timestamp=context.get('current_timestamp'),
+                        temporal_intent=context.get('temporal_intent', 'present'),
+                        retrieved_context=retrieved_context,
+                        temporal_context=parsed_content,
+                        ticket_number=ticket_number,
+                        user_input=user_input
                     )
             
-            # logging.info("Llama prompt\n")
+            # logging.info("Llama prompt:\n")
             # print(f"'''\n{llama_prompt}\n'''\n")
+            # return
 
             # Generate response using LLaMA model, passing the context, retrieved documents, and user input
             response = ollama.chat(
@@ -421,8 +467,8 @@ class PowerOutageAssistant:
                     "content": llama_prompt
                 }],
                 options={
-                    "temperature": 0.4,
-                    "max_tokens": 120,
+                    "temperature": 0.3,
+                    "max_tokens": 100,
                 }
             )
 
@@ -435,10 +481,6 @@ class PowerOutageAssistant:
         except Exception as e:
             logging.error(f"Response generation failed: {str(e)[:200]}")
             return f"{context.get('customer_name', 'Customer')}, system error. Would you like to raise a service request ({ticket_number})?"
-
-
-    def is_valid_email(self, email: str) -> bool:
-        return re.match(r"[^@]+@[^@]+\.[^@]+", email) is not None
 
     def chat(self, user_input: str, user_id: str):
         """Handle user chat and guide them based on intent."""
@@ -509,27 +551,35 @@ class PowerOutageAssistant:
 if __name__ == "__main__":
     assistant = PowerOutageAssistant('data')
 
+    queries = [
+        # 'Why is there no power at my house today?',
+        'Is there any planned outage tomorrow?',
+        # 'Will there be an outage on May 12, 2025?',
+        # 'How many outages were caused by storms this year?',
+        # 'My house has been experiencing a power cut for the last 2 hours.',
+        # 'I think there is a fault, the lights are not turning on.',
+        # 'No response from smart meter and no electricity.',
+        # 'Is there scheduled maintenance at my address tomorrow?',
+        # 'Was there an outage on February 30, 2025?',
+        # 'Why was there no power sometime last week?',
+        # "Will there be an outage tomorrow or next Friday?"
+    ]
     user_id = 1008
-    response = assistant.chat('Why is there no power at my house today?', user_id)
-    print(f"\n[Customer {user_id}] Query: 'Why is there no power at my house today?'\nResponse:", response["message"], '\n')
 
-    response = assistant.chat('How many outages were caused by storms this year?', user_id)
-    print(f"[Customer {user_id}] Query: 'How many outages were caused by storms this year?'\nResponse:", response["message"], '\n')
+    temporal_test_queries = [
+        "Why is there no power at my house today?",
+        "Will there be an outage tomorrow or the day after?",
+        "Please check if something is planned on the upcoming Friday and next Tuesday.",
+        "Is there any power cut scheduled in 3 days or 2 weeks?",
+        "What about maintenance this Sunday or last week?",
+        "Has there been any interruption since yesterday or earlier this week?",
+        "Can you confirm if any work is planned for today or next month?",
+        "Check if the supply will be back by this weekend or the next one.",
+        "Outage on June 5th or the following Monday?",
+        "Is there any downtime planned between now and next Wednesday?",
+        "Will I have electricity on the 25th or 3 days from now?"
+    ]
 
-    response = assistant.chat('My house has been experiencing a power cut for the last 2 hours.', user_id)
-    print(f"[Customer {user_id}] Query: 'My house has been experiencing a power cut for the last 2 hours.'\nResponse:", response["message"], '\n')
-
-    response = assistant.chat('I think there is a fault, the lights are not turning on.', user_id)
-    print(f"[Customer {user_id}] Query: 'I think there is a fault, the lights are not turning on.'\nResponse:", response["message"], '\n')
-
-    response = assistant.chat('No response from smart meter and no electricity.', user_id)
-    print(f"[Customer {user_id}] Query: 'No response from smart meter and no electricity.'\nResponse:", response["message"], '\n')
-
-    response = assistant.chat('Is there scheduled maintenance at my address tomorrow?', user_id)
-    print(f"[Customer {user_id}] Query: 'Is there scheduled maintenance at my address tomorrow?'\nResponse:", response["message"], '\n')
-
-    response = assistant.chat('Was there an outage on February 30, 2025?', user_id)
-    print(f"[Customer {user_id}] Query: 'Was there an outage on February 30, 2025?'\nResponse:", response["message"], '\n')
-
-    response = assistant.chat('Why was there no power sometime last week?', user_id)
-    print(f"[Customer {user_id}] Query: 'Why was there no power sometime last week?'\nResponse:", response["message"], '\n')
+    for query in temporal_test_queries:
+        response = assistant.chat(query, user_id)
+        print(f"\n[Customer {user_id}] Query: '{query}'\nResponse:", response["message"], '\n')
